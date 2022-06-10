@@ -1,5 +1,8 @@
 
-## Materials for the lecture "Bayesian workflow" at the Nordic Probabilistic AI (ProbAI) School 2022.
+## Materials for the lecture "Bayesian workflow" at the Nordic Probabilistic AI School 2022.
+
+[ProbAI](https://probabilistic.ai/)
+
 
 Disease transmission modelling example:
 - [Case study](https://mc-stan.org/users/documentation/case-studies/boarding_school_case_study.html#4_covid-19_transmission_in_switzerland)
