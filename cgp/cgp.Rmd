@@ -1,0 +1,879 @@
+---
+title: "Bayesian workflow for concentration-response curve fitting"
+author: "Elizaveta Semenova"
+date: "First version 2022-06-13. Last modified `r format(Sys.Date())`."
+output:
+  html_document:
+    #theme: readable
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_download: true
+---
+
+This tutorial is built on the basis of the [publication](https://journals.sagepub.com/doi/10.1177/24725552211028142?icid=int.sj-full-text.similar-articles.1) "Flexible fitting of PROTAC concentration-response curves with changepoint Gaussian Processes". Unlike in the publication, rather than presenting the final model, we will follow the iterative process of model building.
+
+#### Load libraries and utility functions
+
+As the first step, we need to install three libraries - *tidyverse*, *utils* and *rstan*. The two first libraries of the list are standard libraries for performing data analysis in R and we anticipate no issues; to be able to use *rstan* locally, one needs to follow the instructions on [this webpage](https://github.com/stan-dev/rstan/wiki/RStan-Getting-Started). Any further issues related to the installation or usage of *rstan* can be raised at the [Forum](https://discourse.mc-stan.org/). Please do not proceed further until the command *library(rstan)* runs sucessfully.
+```{r}
+  library(utils)
+  library(tidyverse)
+  library(ggplot2)
+  library(rstan)
+  options(mc.cores = parallel::detectCores())
+  rstan_options(auto_write = TRUE)
+```
+
+```{r setup, include=FALSE}
+#knitr::opts_chunk$set(dpi=600)
+knitr::opts_chunk$set(message=FALSE, error=FALSE, warning=FALSE, comment=NA, cache=TRUE, dpi=600)
+# switch this to TRUE to save figures in separate files
+savefigs <- TRUE
+#knitr::opts_chunk$set(dev = "cairo_pdf")
+```
+
+
+We will need a few functions for post-processing of posterior samples, which are located in the file *functions.R*. Make sure to set working directory to the directory of the current file. Then execute the following line:
+```{r functions}
+  source("../modelgp/functions.R")
+```
+
+Set up the number of iterations of an MCMC (niter) and the number of prediction points (N_pred). They have high impact on the computation time.
+```{r}
+  niter <- 5000
+  N_pred <- 200
+```  
+
+## Domain understanding
+
+Concentration-response (CR) experiments are routinely conducted to assess potency (or toxicity) of drug candidates. Compounds are ranked based on such quantities as the half-maximal degradation concentration (DC50), estimated from the curves, and only some of them are selected for further drug development process.  
+
+Traditional small molecules typically yield sigmoidal (S-shaped) monotonic CR curves, characterized by a plateau at high drug concentrations. Such curves are traditionally fitted using the Hill's (4PL) model.
+
+
+PROTAC is a new drug modality. Unlike small molecules, its CR curves can have a distinct profile, marked by a loss of efficacy at higher doses. Theoretical modelling has predicted that the curve can have a "hook". However, experimental data frequently display nonsymmetric patterns. A common solution includes manually omitting points (the so-called masking step), allowing standard models to be used on the reduced data sets - a very subjective and non-reproducible step!
+
+
+## Read and plot raw data
+```{r read_data, echo=FALSE}
+  controls <- read.csv(file = '../datagp/controls.csv') %>% select('Normalized')
+  compound <- read.csv(file = '../datagp/compound.csv')
+```
+<!-- We read in raw data files and take a look at their content: 
+
+```{r, echo=FALSE}
+ head(controls)
+```
+
+```{r, echo=FALSE}
+ head(compound)
+```
+
+Pre-process raw data for further analysis: transform concentration to the log-10 scale and scale controls in the same way as the treatment measurements will be scaled for the Stan model.
+-->
+
+
+```{r, echo=FALSE}
+
+  compound <- compound %>%
+    select(concentration, activity) %>%
+    mutate(log_concentration = log10(concentration * 10^(-6))) %>% 
+    arrange(log_concentration)
+  
+  # scaling controls
+  sd_global <- sd(compound $activity)
+  controls_sc <- controls / sd_global
+```
+
+Before conducting the analysis, it is useful to plot the raw data: both cases and controls. To visualize the controls, we chose the minimal available treatmnent concentration as their x-value and add noise to this coordinate:
+```{r raw_data, fig.width=9, fig.height=6, echo=FALSE}
+
+# these transformations are only for plotting - they will be repeated publicly later in the code to prepare data for modelling
+cpd <- compound %>%
+    mutate(rep_ind = rep(c(1,2), nrow(compound)/2),
+           coord_ind = rep(1: (nrow(compound)/2), each=2),
+           activity_sc = activity/ sd_global)
+x_long <- cpd$log_concentration
+x <- unique(x_long)
+x_pred <- seq(min(x), max(x), length.out=N_pred)
+y_sc <- cpd$activity_sc
+controls_sc_plot <- controls_sc$Normalized
+
+par(mai=c(1,1,1,1))
+ptscex <-  1.0
+title <- ""
+
+col3 <- "#00998a" 
+point_cols <- c("tomato", "dodgerblue4", "darkolivegreen3", "goldenrod3")
+
+plot(0, 
+     ylab = 'Target protein degradation (%)', 
+     xlab = expression('log'[10]*'-concentration [M]'), 
+     pch='',
+     ylim=c(-110, 10),
+     xlim= c(min(x, x_pred), max(x, x_pred)),
+     cex.lab =  1.0,
+     main=title,
+     cex.main= 1.0)
+
+lims <- par("usr")
+
+# controls 
+points(rep(min(x_long), length(controls_sc_plot)) + rnorm(length(controls_sc_plot), 0, 0.1), controls$Normalized, pch=8, col='grey40', cex=ptscex)
+
+# observations
+points(x_long, y_sc * sd_global, pch=19, col=point_cols[cpd$rep_ind], cex=ptscex)
+
+legend("topright", 
+       legend = c("observations-replicate1", 
+                  "observations-replicate2", 
+                  "controls"),
+       col = c(point_cols[1],
+               point_cols[2],
+               "grey40"),
+       pch = c(19, 19, 8), 
+       lty=c(NA,NA, NA),
+       lwd=c(NA,NA, NA),
+       bty = "n", 
+       pt.cex = 1, 
+       cex = 1.0, 
+       text.col = "black",
+       inset = c(0.05, 0.01))
+```
+
+<!-- 
+
+```{r}
+# create an artificial dataset to plot controls, and add jitter to their x-coordinate
+controls_to_plot <- controls
+controls_to_plot['x'] = rep(min(compound$log_concentration) , nrow(controls_to_plot)) + rnorm(nrow(controls_to_plot), 0,0.08)
+names(controls_to_plot) <- c("activity", "log_concentration")
+ 
+p <-  ggplot(compound, aes(x=log_concentration, y=activity)) +
+    geom_point(colour="tomato") + labs(x ="Log-concentration (x)", y = "Degradation (y)") +
+    geom_point(data=controls_to_plot, color="grey40")
+
+p
+```
+-->
+
+## Likelihood
+
+Sources of uncertainty originate from the replicate-to-replicate variation, as well as uncertainty in the mean predicted curve:
+
+\begin{align}
+    y &\sim N(\underline{y}, \sigma^2 I), \\   
+    y^\text{treatment}_\text{rep} &\sim t_\nu (y, \sigma_\text{rep}), \\
+    y^\text{control}_\text{rep} &\sim t_\nu (\mu, \sqrt{\sigma^2 + \sigma_\text{rep}}),
+\end{align}
+
+
+where $\underline{y}$ is the mean predicted curve, $\sigma$ is curve uncertainty, $\sigma_\text{rep}$ is the variation between replicates.
+
+<center>![Sources of variation](figures/variation.png){width=50%}</center>
+
+The remaining part of the problem is to find a good model for the curve $\underline{y}$.
+
+## Traditional 4PL model
+
+The parameteric Hill's (4PL) model has the form
+
+$$\underline{y}(x) = d + \frac{a-d}{1 + \exp(-b(x-c))}, $$
+where $d$ is the degradation at zero concentration, $a = \text{Dmax}$, $c = \log10(\text{DC50})$, $x$ is the $log10$-dose, $b$ is the Hill’s slope.
+
+### Prepare data for Stan
+
+To fit the Stan model, we will use the file *"4pl.stan"*. Its *data* section contains description of 7 data entries. To be able to run the model successfully, we need to provide these quantities in the list format:
+```{r}
+  # add replicate number and unique concentration index
+  compound <- compound %>%
+    mutate(rep_ind = rep(c(1,2), nrow(compound)/2),
+           coord_ind = rep(1: (nrow(compound)/2), each=2),
+           activity_sc = activity/ sd_global)
+  
+  # prepare data for Stan
+  x_long <- compound$log_concentration
+  x <- unique(x_long)
+  N <- length(x)
+  coord_ind <- compound$coord_ind
+  y_sc <- compound$activity_sc
+  N_y <- length(y_sc)
+  controls_sc <- controls_sc$Normalized
+
+  stan_dat <- list(N_conc = N, 
+                   N_treatment = N_y, 
+                   x = x, 
+                   y_treatment = y_sc, 
+                   x_index = coord_ind,
+                   N_control = length(controls_sc),
+                   y_control = controls_sc)
+```
+
+
+### Compile Stan 4PL model
+Make sure that the Stan file is located in the same directory as the current R file. Then compile the Stan model:
+```{r 4pl_compile}
+mod <- stan_model(file="../modelgp/4pl.stan")
+```
+
+Please note that the compilation of the model might take some time. After this has been done once, there is no need to recompile to run the model again (given that there has been no changes in the Stan file). After the initial compilation, this line can be commented out.
+
+### Fit Stan model
+To fit the Stan model, we need to provide the prepared data *stan_dat* and the compiled model *mod*. We specify the number of chains and iterations for each chain:
+
+```{r 4pl_fit}
+  # fit the model
+
+  m <- sampling(mod, 
+                data = stan_dat, 
+                iter = niter, 
+                chains = 4, 
+                cores=4)
+  
+  # how long did it take for the model to run?
+  times <- print(get_elapsed_time(m))
+  print(paste0("Stan mean computation time : ", round(mean(apply(times, 1, sum)),2), " sec"))
+  print(paste0("Stan sd computation time : ", round(sd(apply(times, 1, sum)),2), " sec"))
+```
+
+### Evaluate convergence
+
+Results of Bayesian inference should only be used if the chains have achieved convergence. It can be assessed both using numerical measures. Among numerical measures is the R-hat statistics, which should be close to 1.
+
+```{r 4pl_eval}
+  pars = c("sigma_rep",  "sigma", "d", "a", "c", "b")
+
+  # evaluate convergence by Rhat and n_eff
+  print(m, 
+        pars = pars,
+        probs = c(0.10, 0.5, 0.75, 0.90),
+        digits_summary = 2, include = TRUE)
+```
+
+Visually convergence can be estimated using traceplots and posterior density plots. Traceplots characterize stationarity: if a chain has converge, we will see its walks around the same value, i.e. it would have, globally, a horizontal trend.
+
+```{r 4pl_trace}
+# traceplots
+traceplot(m, pars = pars, inc_warmup=FALSE)
+```
+
+We observe that traceplots for all parameters and all chains are of stationary character.
+
+
+```{r 4pl_posterior}
+  # posterior density plots
+  stan_dens(m, pars = pars, separate_chains = TRUE)
+```
+
+We observe that posterior density plots of different chains have very high overlap for all parameters. This means that all chians agree on the estimates.
+
+### Calculate predictions
+```{r}
+# extract samples
+  d <- rstan::extract(m, pars="d")[[1]]
+  a <- rstan::extract(m, pars="a")[[1]]
+  b <- rstan::extract(m, pars="b")[[1]]
+  c <- rstan::extract(m, pars="c")[[1]]
+  N_samp <- length(d)
+  
+  x_pred <- seq(min(x), max(x), length.out=N_pred)
+  
+  mean_response <- y_4pl(x_pred, N_samp, d, a, b, c)
+  
+  # convert back to original scale
+  ypred <- mean_response * sd_global
+  ypred_mean <- apply(ypred, 2, mean)
+  ypred_95 <- apply(ypred, 2, function(x) quantile(x, probs = c(0.025, 0.975)))
+  ypred.df = data.frame(x = c(x_pred), ypred = ypred_mean, ypred_025 = ypred_95[1,], ypred_975 = ypred_95[2,])
+  ypred.df = ypred.df[order(ypred.df$x),]
+
+```
+
+### Biologically meaningful parameters
+```{r}
+  DC50_samps <- c
+  Dmax_samps <- a * sd_global
+  S0_samps <- d * sd_global
+  
+  DC50 <- quantile(DC50_samps, probs= c(0.025, 0.25, 0.5, 0.75, 0.975))
+  Dmax <- quantile(Dmax_samps, probs= c(0.025, 0.25, 0.5, 0.75, 0.975))
+  S0 <- quantile(S0_samps, probs= c(0.025, 0.25, 0.5, 0.75, 0.975))
+```
+
+
+### Plot results
+The estimated curve and biologically relevant parameters can be displayed visually together with their uncertainties:
+```{r 4pl_res, fig.width=9, fig.height=6}
+
+ par(mai=c(1,1,1,1))
+ ptscex <-  1.0
+ title <- ""
+  
+ col3 <- "#00998a" 
+ point_cols <- c("tomato", "dodgerblue4", "darkolivegreen3", "goldenrod3")
+  
+ plot(0, 
+       ylab = 'Target protein degradation (%)', 
+       xlab = expression('log'[10]*'-concentration [M]'), 
+       pch='',
+       #ylim= c(min(gp, y), max(gp, y)), 
+       ylim=c(-110, 10),
+       xlim= c(min(x, x_pred), max(x, x_pred)),
+       cex.lab =  1.0,
+       main=title,
+       cex.main= 1.0)
+  
+  lims <- par("usr")
+  
+  # controls 
+  points(rep(min(x_long), length(controls_sc)) + rnorm(length(controls_sc), 0, 0.1), controls$Normalized, pch=8, col='grey40', cex=ptscex)
+  
+  # observations
+  points(x_long, y_sc * sd_global, pch=19, col=point_cols[compound$rep_ind], cex=ptscex)
+  
+
+  # Dmax
+ rect(lims[1], Dmax[1], lims[2], Dmax[5],  col=alpha("goldenrod1", 0.4), border=FALSE)
+ abline(h=Dmax[3], col="goldenrod4", lty = 2, lwd=2) # darkgreen
+ text(lims[1]+0.3, Dmax[3]+5,  expression('D'["max"]), cex= 1.0)
+  
+
+  # DC50
+ rect(DC50[1], lims[3], DC50[5], lims[4],  col=alpha("steelblue", 0.2), border=FALSE)
+ abline(v=DC50[3], col="steelblue", lty= 2, lwd=2)
+ text(DC50[3]+0.5, lims[3]+5, expression('log'[10]*'(DC'[50]*')'), cex= 1.0)
+  
+  # S0
+  #rect(lims[1], S0[1], lims[2], S0[5],  col=alpha("goldenrod1", 0.4), border=FALSE)
+  #abline(h=S0[3], col="goldenrod4", lty = 2, lwd=2) # darkgreen
+  #text(lims[1]+0.7, S0[3]+5,  expression('S'["0"]), cex=1.0)
+  
+  
+  polygon(c(ypred.df$x,rev(ypred.df$x)),c(ypred.df$ypred_975,rev(ypred.df$ypred_025)),
+          col=alpha(col3,0.2), border=NA)
+
+  lines(ypred.df$x, ypred.df$ypred, pch=19, col="darkslategray", lwd=2)
+
+  legend("topright", 
+          legend = c("observations-rep1", 
+                    "observations-rep2",  
+                     "controls",
+                     "mean prediction",
+                     #"95% BCI", 
+                     expression('D'["max"]),
+                     #expression('D'["max"]*' 95% BCI'),
+                     expression('log'[10]*'(DC'[50]*')')),
+                    #,expression('log'[10]*'(DC'[50]*')'*' 95% BCI')),
+          col = c(point_cols[1],
+                  point_cols[2],
+                  "grey40",
+                  "darkslategray", 
+                  #alpha(col3,0.8), 
+                  "goldenrod1",
+                  #"goldenrod1",
+                  "steelblue"),
+                  #,alpha("steelblue", 0.6)),
+         #pch = c(19, 19, 8, NA, 15,  NA, 15, NA, 15), 
+         pch = c(19, 19, 8, NA,  NA, NA), 
+         #lty=c(NA,NA, NA, 1,NA, 2, NA, 2, NA),
+         lty=c(NA,NA, NA, 1, 2, 2),
+         #lwd=c(NA,NA, NA,3,NA,3, NA, 3, NA),
+         lwd=c(NA,NA, NA,3,3, 3),
+         bty = "n", 
+         pt.cex = 1, 
+         cex = 1.0, 
+         text.col = "black",
+         inset = c(0.05, 0.01))
+```
+
+The fitted curve corresponds well to our biological understanding of the process (there is no degradation at very low concentrations, and at higher concentrations degradation begins). However, it is unable to capture the "hook" and variable degradation rates at higher concentrations.
+
+## Gaussian Process (GP) model 
+Gaussian Process model allows to fit flexible curve shapes and is defined as 
+$$f \sim \mbox{GP}(0,K),$$
+
+where $K$ is the covariance matrix. We chose the GP to have exponentiated quadratic covariance function: 
+
+$$ K[i,j] = \eta^2  \exp\left(-\frac{(x_i-x_j)^2}{\rho^2}\right).$$
+
+Parameters $\eta$ and $\rho$ define the amplitude and lengthscale of the curve, correspondingly.
+
+### Compile Stan model
+```{r gp_compile}
+mod <- stan_model(file="../modelgp/model_gp.stan")
+```
+
+### Fit vanilla GP
+```{r gp_fit}
+  # fit the model
+  m <- sampling(mod, 
+                data = stan_dat, 
+                iter = niter, 
+                chains = 4, 
+                cores=4)
+  
+  # how long did it take for the model to run?
+  times <- print(get_elapsed_time(m))
+  print(paste0("Stan mean computation time : ", round(mean(apply(times, 1, sum)),2), " sec"))
+  print(paste0("Stan sd computation time : ", round(sd(apply(times, 1, sum)),2), " sec"))
+```
+
+### Evaluate convergence
+
+```{r gp_eval}
+  pars = c("sigma_rep",  "sigma", "mu", "rho", "eta", "nu")
+
+  # evaluate convergence by Rhat and n_eff
+  print(m, 
+        pars = pars,
+        probs = c(0.10, 0.5, 0.75, 0.90),
+        digits_summary = 2, include = TRUE)
+```
+
+Visually convergence can be estimated using traceplots and posterior density plots. Traceplots characterize stationarity: if a chain has converge, we will see its walks around the same value, i.e. it would have, globally, a horizontal trend.
+
+```{r gp_trace}
+# traceplots
+traceplot(m, pars = pars, inc_warmup=FALSE)
+```
+
+We observe that traceplots for all parameters and all chains are of stationary character.
+
+
+```{r gp_posterior}
+  # posterior density plots
+  stan_dens(m, pars = pars, separate_chains = TRUE)
+```
+
+We observe that posterior density plots of different chains have very high overlap for all parameters. This means that all chians agree on the estimates.
+
+### Kriging
+After the posterior samples have been obtained, we can use them to perform kriging, i.e. prediction of the activity values at unobserved concentrations. We begin by extracting posterior samples of each parameter from the *stanfit* object *m*:
+```{r}
+ # extract samples
+  mu <- rstan::extract(m, pars="mu")[[1]]
+  rho <- rstan::extract(m, pars="rho")[[1]]
+  sigma <- rstan::extract(m, pars="sigma")[[1]]
+  sigma_rep <- rstan::extract(m, pars="sigma_rep")[[1]]
+  eta <- rstan::extract(m, pars="eta")[[1]]
+  y <- t(rstan::extract(m, pars="y")[[1]])
+  N_samp <- length(mu)
+```
+
+
+To perform kriging, we need to define prediction points $x_\text{pred},$ i.e. the concentration at which we would like to obtain the estimates of the activity. We chose a uniform grid between the minimal and the maximal measured concentrations:
+```{r}  
+  x_pred <- seq(min(x), max(x), length.out=N_pred)
+```
+
+Given the concentrations $x$ at which the measurements have been performed, the predictive grid $x_\text{pred}$ and posterior samples of parameters, we can perform kriging and convert predictions to the original scale:
+```{r}  
+  SigmaMM <- CalcSigma(x, x, N_samp, eta, rho, sigma)
+  SigmaNM <- CalcSigma(x_pred, x, N_samp, eta, rho, sigma)
+  
+  SigmaMM_inv <- array(data = NA, dim = c(N_samp, N, N))
+  for (k in 1:N_samp){
+    SigmaMM_inv[k, , ] = solve(SigmaMM[k, , ])
+  }
+  
+  mean_response <- array(data=NA, dim = c(N_samp, N_pred))
+  
+  for (k in 1:N_samp){
+    mean_response[k,] = mu[k] + ((SigmaNM[k,,] %*% SigmaMM_inv[k,,])  %*% (y[, k] - mu[k]))
+  }
+  
+  # convert back to original scale
+  gp <- mean_response * sd_global
+  gp_mean <- apply(gp, 2, mean)
+  gp_95 <- apply(gp, 2, function(x) quantile(x, probs = c(0.025, 0.975)))
+  gp.df = data.frame(x = c(x_pred), gp = gp_mean, gp_025 = gp_95[1,], gp_975 = gp_95[2,])
+  gp.df = gp.df[order(gp.df$x),]
+```
+
+
+### Biologically meaningful parameters
+Now we have obtained estimaes of the GP at a finer scale than the initial measurements were observed and can use them to calculate biologically relevant parameters of interest:
+```{r}
+  DC50_samps <- rep(NA, dim(gp)[1])
+  Dmax_samps <- rep(NA, dim(gp)[1])
+  
+  for (i in 1: dim(gp)[1]){
+    DC50_samps[i] <- DC50_func(mu[i], gp[i,], gp.df$x, eps=0.15)[[1]]
+    Dmax_samps[i] <- min(gp[i,])
+  }
+  
+  DC50 <- quantile(DC50_samps, probs= c(0.025, 0.25, 0.5, 0.75, 0.975))
+  Dmax <- quantile(Dmax_samps, probs= c(0.025, 0.25, 0.5, 0.75, 0.975))
+  
+  h <- hist(DC50_samps, breaks = 500, plot = FALSE)
+  px <- h$density
+  DC50_draws <- sample(h$mids, size = niter * 1.5, replace = TRUE, prob = px)
+```
+
+
+### Plot results
+The estimated curve and biologically relevant parameters can be displayed visually together with their uncertainties:
+```{r gp_res, fig.width=9, fig.height=6}
+  
+  par(mai=c(1,1,1,1))
+  ptscex <-  1.0
+  title <- ""
+  
+  col3 <- "#00998a" 
+  point_cols <- c("tomato", "dodgerblue4", "darkolivegreen3", "goldenrod3")
+  
+  plot(0, 
+       ylab = 'Target protein degradation (%)', 
+       xlab = expression('log'[10]*'-concentration [M]'), 
+       pch='',
+       #ylim= c(min(gp, y), max(gp, y)), 
+       ylim=c(-110, 10),
+       xlim= c(min(x, x_pred), max(x, x_pred)),
+       cex.lab =  1.0,
+       main=title,
+       cex.main= 1.0)
+  
+  lims <- par("usr")
+  
+  # controls 
+  points(rep(min(x_long), length(controls_sc)) + rnorm(length(controls_sc), 0, 0.1), controls$Normalized, pch=8, col='grey40', cex=ptscex)
+  
+  # observations
+  points(x_long, y_sc * sd_global, pch=19, col=point_cols[compound$rep_ind], cex=ptscex)
+  
+ 
+  # Dmax
+  rect(lims[1], Dmax[1], lims[2], Dmax[5],  col=alpha("goldenrod1", 0.4), border=FALSE)
+  abline(h=Dmax[3], col="goldenrod4", lty = 2, lwd=2) # darkgreen
+  text(lims[1]+0.3, Dmax[3]+5,  expression('D'["max"]), cex= 1.0)
+  
+  
+  # DC50
+  rect(DC50[1], lims[3], DC50[5], lims[4],  col=alpha("steelblue", 0.2), border=FALSE)
+  abline(v=DC50[3], col="steelblue", lty= 2, lwd=2)
+  text(DC50[3]+0.5, lims[3]+5, expression('log'[10]*'(DC'[50]*')'), cex= 1.0)
+  
+  polygon(c(gp.df$x,rev(gp.df$x)),c(gp.df$gp_975,rev(gp.df$gp_025)),
+          col=alpha(col3,0.2), border=NA)
+  
+  lines(gp.df$x, gp.df$gp, pch=19, col="darkslategray", lwd=2)
+  
+  legend("topright", 
+         legend = c("observations-rep1", 
+                    "observations-rep2", 
+                    "controls",
+                    "GP mean",
+                    expression('log'[10]*'(PoD)'), 
+                    expression('D'["max"]),
+                    expression('log'[10]*'(DC'[50]*')')),
+         col = c(point_cols[1],
+                 point_cols[2],
+                 "grey40",
+                 "darkslategray", 
+                 "coral3", 
+                 "goldenrod1",
+                 "steelblue"),
+         pch = c(19, 19, 8, NA,  NA, NA, NA), 
+         lty=c(NA,NA, NA, 1,2, 2,  2),
+         lwd=c(NA,NA, NA,3,3,3, 3),
+         bty = "n", 
+         pt.cex = 1, 
+         cex = 1.0, 
+         text.col = "black",
+         inset = c(0.05, 0.01))
+```
+
+This curve shows more flexibility at higher concentrations. However, it lost the desired properties at low comcentrations.
+
+## Changepoint GP model
+
+Kernel design allows to specify a wider range of priors.
+Changepoint between two GPs is defined as 
+
+\begin{align*}
+    f_1(x) &\sim \text{GP}(0,k_1) \\
+    f_2(x) &\sim \text{GP}(0,k_2),\\
+    f(x) &:= (1 - w(x)) f_1(x) + w(x) f_2(x) \sim \text{GP}(0,k), \\
+    & \text{ where}\\
+    k(x, x^{'}) &= (1 - w(x)) k_1(x, x') (1 - w(x')) + w(x) k_2(x, x')w(x') 
+\end{align*}
+These formulas are easy to understand if we chose the transition function as a step function $w(x)=s_\theta(d),$ where $d = x - \theta$ and
+\[
+    s_\theta(d)= 
+\begin{cases}
+    0& \text{if } d \le 0,\\
+    1 & \text{if } d > 0.\\
+\end{cases}
+\]
+The most popular choice of $w(x)$ is the inverse logit (sigmoidal) function. A steep sigmoidal function $$\sigma(g*x), g>1$$ is a good approximator of the step function.
+
+### Explore changepoint GP priors
+
+We explore the shapes of prior curves based on the value of $g$.
+
+```{r, echo=FALSE}
+N_prior <- 501
+x_prior <- 3 * (0:(N_prior - 1)) / (N_prior - 1) - 8
+rho_true <- 0.5
+sigma_true <- 0.3
+theta_true <- -7
+g_true <- 100
+
+simu_data <- list(alpha=2, rho=rho_true,
+                  N=N_prior, x=x_prior, 
+                  theta=theta_true, sigma=sigma_true, g = g_true, k2 = 1)
+
+simu_100 <- stan(file='../modelgp/changepoint_priors.stan', 
+                   data=simu_data, 
+                   warmup=0, 
+                   iter=4000, 
+                   chains=1, 
+                   seed=494838,
+                   algorithm="Fixed_param", 
+                   refresh=4000)
+```
+
+```{r cgp_prior_100, fig.width=10, fig.height=6, dpi=600}
+reals <- plot_gp_prior_realizations(simu_100, x_prior, "g=100")
+```
+
+
+```{r, echo=FALSE}
+g_true <- 10
+
+simu_data <- list(alpha=2, rho=rho_true,
+                  N=N_prior, x=x_prior, 
+                  theta=theta_true, sigma=sigma_true, g = g_true, k2 = 1)
+
+simu_10 <- stan(file='../modelgp/changepoint_priors.stan', 
+                   data=simu_data, 
+                   warmup=0, 
+                   iter=4000, 
+                   chains=1, 
+                   seed=494838,
+                   algorithm="Fixed_param", 
+                   refresh=4000)
+```
+
+```{r cgp_prior_10, fig.width=10, fig.height=6, dpi=600}
+reals <- plot_gp_prior_realizations(simu_10, x_prior, "g=10")
+```
+
+```{r, echo=FALSE}
+g_true <- 1
+
+simu_data <- list(alpha=2, rho=rho_true,
+                  N=N_prior, x=x_prior, 
+                  theta=theta_true, sigma=sigma_true, g = g_true, k2 = 1)
+
+simu_1 <- stan(file='../modelgp/changepoint_priors.stan', 
+                   data=simu_data, 
+                   warmup=0, 
+                   iter=4000, 
+                   chains=1, 
+                   seed=494838,
+                   algorithm="Fixed_param", 
+                   refresh=4000)
+```
+
+```{r cgp_prior_1, fig.width=10, fig.height=6, dpi=600}
+reals <- plot_gp_prior_realizations(simu_1, x_prior, "g=1")
+```
+
+We observe that curves corresponding to $g=100$ and $g=1$ are too extreme, while the curve $g=10$ is able to describe the types of curves which we would like to model.
+
+### Compile Stan model
+
+```{r}
+mod <- stan_model(file="../modelgp/model_invlogit_nu_g.stan")
+```
+
+### Fit changepoint GP
+
+
+```{r}
+  m <- sampling(mod, 
+                data = stan_dat, 
+                iter = niter, 
+                chains = 4, 
+                cores=4)
+  
+  times <- print(get_elapsed_time(m))
+  print(paste0("Stan mean computation time : ", round(mean(apply(times, 1, sum)),2), " sec"))
+  print(paste0("Stan sd computation time : ", round(sd(apply(times, 1, sum)),2), " sec"))
+```
+
+### Evaluate convergence
+
+```{r}
+  pars = c("sigma_rep",  "sigma", "mu", "rho", "eta", "nu", "g")
+
+  # evaluate convergence by Rhat and n_eff
+  print(m, 
+        pars = pars,
+        probs = c(0.10, 0.5, 0.75, 0.90),
+        digits_summary = 2, include = TRUE)
+```
+
+```{r}
+# traceplots
+traceplot(m, pars = pars, inc_warmup=FALSE)
+```
+
+```{r}
+  # posterior density plots
+  stan_dens(m, pars = pars, separate_chains = TRUE)
+```
+
+### Kriging
+```{r}
+ # extract samples
+  mu <- rstan::extract(m, pars="mu")[[1]]
+  rho <- rstan::extract(m, pars="rho")[[1]]
+  theta <- rstan::extract(m, pars="theta")[[1]]
+  sigma <- rstan::extract(m, pars="sigma")[[1]]
+  sigma_rep <- rstan::extract(m, pars="sigma_rep")[[1]]
+  eta <- rstan::extract(m, pars="eta")[[1]]
+  g_par <- rstan::extract(m, pars="g")[[1]]
+  y <- t(rstan::extract(m, pars="y")[[1]])
+  N_samp <- length(mu)
+```
+
+```{r}  
+  SigmaMM <- CalcSigma_g(x, x, N_samp, eta, rho, sigma, theta, g_par)
+  SigmaNM <- CalcSigma_g(x_pred, x, N_samp, eta, rho, sigma, theta, g_par)
+  
+  SigmaMM_inv <- array(data = NA, dim = c(N_samp, N, N))
+  for (k in 1:N_samp){
+    SigmaMM_inv[k, , ] = solve(SigmaMM[k, , ])
+  }
+  
+  mean_response <- array(data=NA, dim = c(N_samp, N_pred))
+  
+  for (k in 1:N_samp){
+    mean_response[k,] = mu[k] + ((SigmaNM[k,,] %*% SigmaMM_inv[k,,])  %*% (y[, k] - mu[k]))
+  }
+  
+  theta_mean <- mean(theta)
+  
+  # convert back to original scale
+  gp <- mean_response * sd_global
+  gp_mean <- apply(gp, 2, mean)
+  gp_95 <- apply(gp, 2, function(x) quantile(x, probs = c(0.025, 0.975)))
+  gp.df = data.frame(x = c(x_pred), gp = gp_mean, gp_025 = gp_95[1,], gp_975 = gp_95[2,])
+  gp.df = gp.df[order(gp.df$x),]
+```
+
+### Biologically meaningful parameters
+```{r}
+  DC50_samps <- rep(NA, dim(gp)[1])
+  Dmax_samps <- rep(NA, dim(gp)[1])
+  
+  for (i in 1: dim(gp)[1]){
+    DC50_samps[i] <- DC50_func(mu[i], gp[i,], gp.df$x, eps=0.15)[[1]]
+    Dmax_samps[i] <- min(gp[i,])
+  }
+  
+  DC50 <- quantile(DC50_samps, probs= c(0.025, 0.25, 0.5, 0.75, 0.975))
+  Dmax <- quantile(Dmax_samps, probs= c(0.025, 0.25, 0.5, 0.75, 0.975))
+  
+  h <- hist(DC50_samps, breaks = 500, plot = FALSE)
+  px <- h$density
+  DC50_draws <- sample(h$mids, size = niter * 1.5, replace = TRUE, prob = px)
+```
+
+
+### Plot results
+```{r cgp_res, fig.width=9, fig.height=6}
+  
+  par(mai=c(1,1,1,1))
+  ptscex <-  1.0
+  title <- ""
+  
+  col3 <- "#00998a" 
+  point_cols <- c("tomato", "dodgerblue4", "darkolivegreen3", "goldenrod3")
+  
+  plot(0, 
+       ylab = 'Target protein degradation (%)', 
+       xlab = expression('log'[10]*'-concentration [M]'), 
+       pch='',
+       ylim=c(-110, 10),
+       xlim= c(min(x, x_pred), max(x, x_pred)),
+       cex.lab =  1.0,
+       main=title,
+       cex.main= 1.0)
+  
+  lims <- par("usr")
+  
+  # controls 
+  points(rep(min(x_long), length(controls_sc)) + rnorm(length(controls_sc), 0, 0.1), controls$Normalized, pch=8, col='grey40', cex=ptscex)
+  
+  # observations
+  points(x_long, y_sc * sd_global, pch=19, col=point_cols[compound$rep_ind], cex=ptscex)
+  
+  # theta
+  abline(v=theta_mean, col="coral3", lty = 2, lwd=2) # coral3
+  theta_95 <- quantile(theta, probs = c(0.025, 0.25, 0.75, 0.975))
+  rect(theta_95[1], lims[3], theta_95[4], lims[4],  col=alpha("coral3", 0.2), border=FALSE)
+  text(theta_mean+0.5, lims[3]+5, expression('log'[10]*'(PoD)'), cex= 1.0)
+  
+  
+  # Dmax
+  rect(lims[1], Dmax[1], lims[2], Dmax[5],  col=alpha("goldenrod1", 0.4), border=FALSE)
+  abline(h=Dmax[3], col="goldenrod4", lty = 2, lwd=2) # darkgreen
+  text(lims[1]+0.3, Dmax[3]+5,  expression('D'["max"]), cex= 1.0)
+  
+  
+  # DC50
+  rect(DC50[1], lims[3], DC50[5], lims[4],  col=alpha("steelblue", 0.2), border=FALSE)
+  abline(v=DC50[3], col="steelblue", lty= 2, lwd=2)
+  text(DC50[3]+0.5, lims[3]+5, expression('log'[10]*'(DC'[50]*')'), cex= 1.0)
+  
+  polygon(c(gp.df$x,rev(gp.df$x)),c(gp.df$gp_975,rev(gp.df$gp_025)),
+          col=alpha(col3,0.2), border=NA)
+  
+  lines(gp.df$x, gp.df$gp, pch=19, col="darkslategray", lwd=2)
+  
+  legend("topright", 
+         legend = c("observations-rep1", 
+                    "observations-rep2", 
+                    "controls",
+                    "GP mean",
+                    expression('log'[10]*'(PoD)'), 
+                    expression('D'["max"]),
+                    expression('log'[10]*'(DC'[50]*')')),
+         col = c(point_cols[1],
+                 point_cols[2],
+                 "grey40",
+                 "darkslategray", 
+                 "coral3", 
+                 "goldenrod1",
+                 "steelblue"),
+         pch = c(19, 19, 8, NA, NA,  NA, NA), 
+         lty=c(NA,NA, NA, 1,2, 2,  2),
+         lwd=c(NA,NA, NA,3,3,3, 3),
+         bty = "n", 
+         pt.cex = 1, 
+         cex = 1.0, 
+         text.col = "black",
+         inset = c(0.05, 0.01))
+```
+
+Print estimates of biologically meaningful parameters
+```{r}
+
+out.df <- data.frame(Dmax = c(Dmax[1], Dmax[3], Dmax[5]),
+                       DC50 = c(DC50[1], DC50[3], DC50[5]),
+                       theta = c(theta_95[1], theta_mean, theta_95[4]))
+  
+cat('Parameter estimates :\n')
+round(t(out.df),2)
+```
+
+
+####  Computational environment
+```{r}
+sessionInfo()
+```
+
