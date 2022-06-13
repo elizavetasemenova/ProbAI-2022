@@ -4,6 +4,9 @@
 [ProbAI](https://probabilistic.ai/)
 
 
+Slides are available [here](https://www.dropbox.com/s/eyap24uppshwoi2/ProbAI_slides.pdf?dl=0)
+
+
 Disease transmission modelling example:
 - [Case study](https://mc-stan.org/users/documentation/case-studies/boarding_school_case_study.html#4_covid-19_transmission_in_switzerland)
 -  [Publictaion](https://onlinelibrary.wiley.com/doi/10.1002/sim.9164) 
