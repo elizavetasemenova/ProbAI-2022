@@ -4,7 +4,7 @@
 [ProbAI](https://probabilistic.ai/)
 
 
-Slides are available [here.]([https://www.dropbox.com/s/eyap24uppshwoi2/ProbAI_slides.pdf?dl=0](https://www.dropbox.com/s/vc78c0tr4a0qdkp/ProbAI_slides.pdf?dl=0))
+Slides are available [here.](https://www.dropbox.com/s/vc78c0tr4a0qdkp/ProbAI_slides.pdf?dl=0)
 
 
 Disease transmission modelling example:
