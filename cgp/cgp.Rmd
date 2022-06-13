@@ -36,7 +36,7 @@ savefigs <- TRUE
 
 We will need a few functions for post-processing of posterior samples, which are located in the file *functions.R*. Make sure to set working directory to the directory of the current file. Then execute the following line:
 ```{r functions}
-  source("../modelgp/functions.R")
+  source("modelgp/functions.R")
 ```
 
 Set up the number of iterations of an MCMC (niter) and the number of prediction points (N_pred). They have high impact on the computation time.
@@ -57,8 +57,8 @@ PROTAC is a new drug modality. Unlike small molecules, its CR curves can have a 
 
 ## Read and plot raw data
 ```{r read_data, echo=FALSE}
-  controls <- read.csv(file = '../datagp/controls.csv') %>% select('Normalized')
-  compound <- read.csv(file = '../datagp/compound.csv')
+  controls <- read.csv(file = 'datagp/controls.csv') %>% select('Normalized')
+  compound <- read.csv(file = 'datagp/compound.csv')
 ```
 <!-- We read in raw data files and take a look at their content: 
 
@@ -214,7 +214,7 @@ To fit the Stan model, we will use the file *"4pl.stan"*. Its *data* section con
 ### Compile Stan 4PL model
 Make sure that the Stan file is located in the same directory as the current R file. Then compile the Stan model:
 ```{r 4pl_compile}
-mod <- stan_model(file="../modelgp/4pl.stan")
+mod <- stan_model(file="modelgp/4pl.stan")
 ```
 
 Please note that the compilation of the model might take some time. After this has been done once, there is no need to recompile to run the model again (given that there has been no changes in the Stan file). After the initial compilation, this line can be commented out.
@@ -401,7 +401,7 @@ Parameters $\eta$ and $\rho$ define the amplitude and lengthscale of the curve, 
 
 ### Compile Stan model
 ```{r gp_compile}
-mod <- stan_model(file="../modelgp/model_gp.stan")
+mod <- stan_model(file="modelgp/model_gp.stan")
 ```
 
 ### Fit vanilla GP
@@ -624,7 +624,7 @@ simu_data <- list(alpha=2, rho=rho_true,
                   N=N_prior, x=x_prior, 
                   theta=theta_true, sigma=sigma_true, g = g_true, k2 = 1)
 
-simu_100 <- stan(file='../modelgp/changepoint_priors.stan', 
+simu_100 <- stan(file='modelgp/changepoint_priors.stan', 
                    data=simu_data, 
                    warmup=0, 
                    iter=4000, 
@@ -646,7 +646,7 @@ simu_data <- list(alpha=2, rho=rho_true,
                   N=N_prior, x=x_prior, 
                   theta=theta_true, sigma=sigma_true, g = g_true, k2 = 1)
 
-simu_10 <- stan(file='../modelgp/changepoint_priors.stan', 
+simu_10 <- stan(file='modelgp/changepoint_priors.stan', 
                    data=simu_data, 
                    warmup=0, 
                    iter=4000, 
@@ -667,7 +667,7 @@ simu_data <- list(alpha=2, rho=rho_true,
                   N=N_prior, x=x_prior, 
                   theta=theta_true, sigma=sigma_true, g = g_true, k2 = 1)
 
-simu_1 <- stan(file='../modelgp/changepoint_priors.stan', 
+simu_1 <- stan(file='modelgp/changepoint_priors.stan', 
                    data=simu_data, 
                    warmup=0, 
                    iter=4000, 
@@ -686,7 +686,7 @@ We observe that curves corresponding to $g=100$ and $g=1$ are too extreme, while
 ### Compile Stan model
 
 ```{r}
-mod <- stan_model(file="../modelgp/model_invlogit_nu_g.stan")
+mod <- stan_model(file="modelgp/model_invlogit_nu_g.stan")
 ```
 
 ### Fit changepoint GP
